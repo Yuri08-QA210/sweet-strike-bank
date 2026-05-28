@@ -573,23 +573,22 @@ const app = {
   // --- EDR ---
   async refreshEdr() {
     try {
+      // Fetch global EDR status
       const res = await this.apiCall('/edr/', 'GET');
       const data = await res.json();
 
       if (data) {
-        document.getElementById('edr-alerts').textContent = data.alerts ?? '0';
+        document.getElementById('edr-alerts').textContent = data.total_alerts ?? '0';
         document.getElementById('edr-banned').textContent = data.banned_ips ?? '0';
-        document.getElementById('edr-processes').textContent = data.active_processes ?? '0';
-        document.getElementById('edr-quarantined').textContent = data.quarantined ?? '0';
+        document.getElementById('edr-processes').textContent = data.honeypot_triggers ?? '0';
+        document.getElementById('edr-quarantined').textContent = data.honeypot_triggers ?? '0';
 
-        if (data.paranoia_level) {
-          const level = Math.min(5, Math.max(1, data.paranoia_level));
-          document.getElementById('paranoia-fill').style.width = (level / 5 * 100) + '%';
-          document.getElementById('paranoia-value').textContent = level;
-        }
+        const level = Math.min(5, Math.max(0, data.paranoia_level ?? 0));
+        document.getElementById('paranoia-fill').style.width = (level / 5 * 100) + '%';
+        document.getElementById('paranoia-value').textContent = level;
 
         const lockdownBadge = document.getElementById('lockdown-status');
-        if (data.lockdown) {
+        if (data.lockdown_active) {
           lockdownBadge.textContent = 'Active';
           lockdownBadge.classList.remove('inactive');
           lockdownBadge.classList.add('active');
@@ -598,21 +597,29 @@ const app = {
           lockdownBadge.classList.remove('active');
           lockdownBadge.classList.add('inactive');
         }
-
-        // Alerts
-        if (data.recent_alerts && Array.isArray(data.recent_alerts)) {
-          const alertList = document.getElementById('edr-alerts-list');
-          alertList.innerHTML = data.recent_alerts.map(a => `
-            <div class="alert-item">
-              <span class="alert-severity ${a.severity || 'low'}"></span>
-              <div class="alert-info">
-                <span class="alert-msg">${this.escHtml(a.message || a.msg || '')}</span>
-                <span class="alert-time">${this.escHtml(a.time || a.timestamp || '')}</span>
-              </div>
-            </div>
-          `).join('');
-        }
       }
+
+      // Fetch per-IP alerts
+      const alertRes = await this.apiCall('/edr/alerts', 'GET');
+      const alertData = await alertRes.json();
+
+      if (alertData && Array.isArray(alertData.alerts) && alertData.alerts.length > 0) {
+        const alertList = document.getElementById('edr-alerts-list');
+        alertList.innerHTML = alertData.alerts.map(msg => {
+          const severity = msg.toLowerCase().includes('ban') || msg.toLowerCase().includes('lockdown') ? 'high'
+            : msg.toLowerCase().includes('honeypot') || msg.toLowerCase().includes('rate') ? 'medium'
+            : 'low';
+          return `
+            <div class="alert-item">
+              <span class="alert-severity ${severity}"></span>
+              <div class="alert-info">
+                <span class="alert-msg">${this.escHtml(msg)}</span>
+                <span class="alert-time">just now</span>
+              </div>
+            </div>`;
+        }).join('');
+      }
+
     } catch (err) {
       console.error('EDR status error:', err);
     }
