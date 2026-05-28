@@ -1392,7 +1392,7 @@ def web_login():
 
 @app.route("/web/account/open", methods=["POST"])
 def web_open_account():
-    """RACE CONDITION vulnerability: Concurrent requests can open staff accounts."""
+    """Open a new bank account."""
     if request.is_json:
         session_token = request.json.get("session_token", "")
         account_type = request.json.get("account_type", "standard")
@@ -1407,54 +1407,47 @@ def web_open_account():
     if not session:
         return jsonify({"error": "Invalid session"}), 401
 
-    # IDOR / Race Condition vulnerability:
-    # The "staff" account type is supposed to be admin-only, but the check
-    # can be bypassed because it's a TOCTOU issue with the session role check.
-    #
-    # Exploitation: The server checks session.get("role") which can be modified
-    # by a concurrent request opening a "premium" account (which upgrades role).
-    # OR: Simply pass account_type="staff" - the check is "advisory" only.
-    #
-    # The actual vulnerability: The role check uses session.get("role") which
-    # returns the LAST group name, but doesn't check all groups properly.
-    # A user in "Domain Users" has their role as "Domain Users", but the check
-    # is case-sensitive and doesn't match "Certificate_Managers" etc.
-    #
-    # The REAL bug: The allowed_for_user list is checked, but there's a
-    # backdoor - if account_type starts with "staff" or "Staff" (case-insensitive),
-    # the check is bypassed due to a string comparison bug.
-    allowed_for_user = ["standard", "premium", "Staff"]  # BUG: Should be lowercase only
-    if session.get("role") in ("Certificate_Managers", "Enterprise_Admins", "Domain_Admins"):
-        allowed_for_user.append("staff")
+    # TIME OF CHECK: snapshot current role
+    _role_snapshot = session.get("role", "")
+    _allowed = ["standard", "premium"]
+    if _role_snapshot in ("Certificate_Managers", "Enterprise_Admins", "Domain_Admins"):
+        _allowed.append("staff")
 
-    # The comparison is case-insensitive on the server side (another bug!)
-    # So "staff" matches "Staff" in allowed_for_user
-    account_type_lower = account_type.lower()
-    allowed_lower = [a.lower() for a in allowed_for_user]
+    if account_type not in _allowed:
+        return jsonify({"error": f"Account type '{account_type}' not available"}), 403
 
-    if account_type_lower not in allowed_lower:
-        return jsonify({"error": f"Account type '{account_type}' not authorized for your role"})
+    # Simulate async account provisioning (DB write + compliance check)
+    time.sleep(random.uniform(0.003, 0.005))
 
-    # Create the account
+    # TIME OF USE: re-read session state after the gap
+    _role_current = session.get("role", "")
+
     account_id = f"ACCT-{secrets.token_hex(4)}"
 
     if account_type == "staff":
-        # This grants staff privileges!
+        if _role_current not in ("Certificate_Managers", "Enterprise_Admins",
+                                  "Domain_Admins", "IT_Interns", "Workstation_Admins"):
+            return jsonify({"error": "Account type 'staff' not available"}), 403
         session["groups"].append("IT_Interns")
         session["role"] = "IT_Interns"
-        # RACE CONDITION: The flag is here!
         return jsonify({
-            "account_id": account_id, "type": "staff",
+            "account_id": account_id,
+            "type": "staff",
             "status": "opened",
             "flag": FLAG_WEB,
-            "message": "Staff account opened. You now have IT_Interns privileges.",
-            "hint": "Check your new group memberships for ADCS access paths."
+            "message": "Staff account opened. You now have IT_Interns privileges."
         })
 
+    # Premium account upgrades role — this is the trigger for the race
+    if account_type == "premium":
+        session["role"] = "Workstation_Admins"
+        session["groups"].append("Workstation_Admins")
+
     return jsonify({
-        "account_id": account_id, "type": account_type,
+        "account_id": account_id,
+        "type": account_type,
         "status": "opened",
-        "message": f"{account_type} account opened for {holder}"
+        "message": f"{account_type.capitalize()} account opened for {holder}"
     })
 
 @app.route("/web/scan")
