@@ -2409,7 +2409,7 @@ def serve_frontend_index():
     """Serve the SPA frontend at root."""
     return send_from_directory(FRONTEND_DIR, "index.html")
 
-@app.route("/frontend/<path:filename>")
+@app.route("/<path:filename>")
 def serve_frontend_static(filename):
     """Serve static frontend files."""
     return send_from_directory(FRONTEND_DIR, filename)
