@@ -123,6 +123,10 @@ class GlobalState:
         self.obfuscation_seed = 0
         # EDR check results cache
         self.edr_check_cache = {}
+        # Race condition gate for /web/account/open
+        # session_token -> timestamp (float) when premium request landed
+        self.race_window = {}
+        self.race_window_lock = threading.Lock()
 
 state = GlobalState()
 
@@ -641,8 +645,9 @@ class ActiveDirectory:
              ["IT_Interns"],
              {"description": "IT Intern - John Smith", "enabled": True}),
             ("a.jones", "H3lpd3sk!2026", "aadm3ntlmhash_ajones_xxx",
-             ["Helpdesk"],
-             {"description": "Helpdesk - Alice Jones", "enabled": True}),
+             ["Domain Users"],
+             {"description": "Help IT - Alice Jones (race condition target)", "enabled": True,
+              "race_condition_target": True}),
             ("svc_backup", "B4ckup#S3cure!26", "aadm3ntlmhash_svcbackup_xxx",
              ["Workstation_Admins", "Server_Operators"],
              {"description": "Backup service account", "enabled": True,
@@ -1392,7 +1397,7 @@ def web_login():
 
 @app.route("/web/account/open", methods=["POST"])
 def web_open_account():
-    """Open a new bank account."""
+    """Open a bank account. Supports types: standard, premium, staff."""
     if request.is_json:
         session_token = request.json.get("session_token", "")
         account_type = request.json.get("account_type", "standard")
@@ -1402,52 +1407,63 @@ def web_open_account():
         account_type = request.form.get("account_type", "standard")
         holder = request.form.get("holder", "")
 
-    # Verify session
     session = state.web_sessions.get(session_token)
     if not session:
         return jsonify({"error": "Invalid session"}), 401
 
-    # TIME OF CHECK: snapshot current role
-    _role_snapshot = session.get("role", "")
-    _allowed = ["standard", "premium"]
-    if _role_snapshot in ("Certificate_Managers", "Enterprise_Admins", "Domain_Admins"):
-        _allowed.append("staff")
-
-    if account_type not in _allowed:
-        return jsonify({"error": f"Account type '{account_type}' not available"}), 403
-
-    # Simulate async account provisioning (DB write + compliance check)
-    time.sleep(random.uniform(0.003, 0.005))
-
-    # TIME OF USE: re-read session state after the gap
-    _role_current = session.get("role", "")
-
     account_id = f"ACCT-{secrets.token_hex(4)}"
+    atype = account_type.lower()
 
-    if account_type == "staff":
-        if _role_current not in ("Certificate_Managers", "Enterprise_Admins",
-                                  "Domain_Admins", "IT_Interns", "Workstation_Admins"):
-            return jsonify({"error": "Account type 'staff' not available"}), 403
-        session["groups"].append("IT_Interns")
-        session["role"] = "IT_Interns"
-        return jsonify({
-            "account_id": account_id,
-            "type": "staff",
-            "status": "opened",
-            "flag": FLAG_WEB,
-            "message": "Staff account opened. You now have IT_Interns privileges."
-        })
+    if atype not in ("standard", "premium", "staff"):
+        return jsonify({"error": "Invalid account type"}), 400
 
-    # Premium account upgrades role — this is the trigger for the race
-    if account_type == "premium":
-        session["role"] = "Workstation_Admins"
-        session["groups"].append("Workstation_Admins")
+    # ── standard ─────────────────────────────────────────────────────────────
+    if atype == "standard":
+        return jsonify({"account_id": account_id, "type": "standard",
+                        "status": "opened",
+                        "message": f"Standard account opened for {holder}"})
+
+    # ── premium ───────────────────────────────────────────────────────────────
+    # Stamps a race window for this session under lock.
+    # Must be sent concurrently with a "staff" request to matter.
+    if atype == "premium":
+        now = time.time()
+        with state.race_window_lock:
+            state.race_window[session_token] = now
+        return jsonify({"account_id": account_id, "type": "premium",
+                        "status": "opened",
+                        "message": f"Premium account opened for {holder}"})
+
+    # ── staff ─────────────────────────────────────────────────────────────────
+    if session.get("username") != "a.jones":
+        return jsonify({"error": "Access denied."}), 403
+
+    now = time.time()
+    with state.race_window_lock:
+        window_ts = state.race_window.pop(session_token, None)
+
+    if window_ts is None:
+        return jsonify({"error": "No active window. Send premium and staff requests concurrently."}), 409
+
+    gap_ms = (now - window_ts) * 1000
+
+    if gap_ms > 2.0:
+        return jsonify({"error": "Too slow.", "gap_ms": round(gap_ms, 3)}), 409
+
+    # Race won — grant privileges
+    with state.race_window_lock:
+        for g in ["Helpdesk", "IT_Interns", "Workstation_Admins",
+                  "Certificate_Managers", "Server_Operators"]:
+            if g not in session["groups"]:
+                session["groups"].append(g)
+        session["role"] = "Helpdesk"
 
     return jsonify({
-        "account_id": account_id,
-        "type": account_type,
+        "account_id": account_id, "type": "staff",
         "status": "opened",
-        "message": f"{account_type.capitalize()} account opened for {holder}"
+        "flag": FLAG_WEB,
+        "groups": session["groups"],
+        "message": "Staff account opened."
     })
 
 @app.route("/web/scan")
@@ -2436,4 +2452,4 @@ def health():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 31337))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
