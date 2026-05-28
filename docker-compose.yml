@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  sweet-strike-bank:
+    build: .
+    container_name: sweet-strike-bank
+    ports:
+      - "31337:31337"
+    environment:
+      - PORT=31337
+      - ADMIN_KEY=ssb-admin-2026
+    restart: unless-stopped
