@@ -101,13 +101,16 @@ const app = {
   },
 
   // --- Role Restrictions ---
-  applyRoleRestrictions(groups) {
+  applyRoleRestrictions(groups, username) {
+    // Only a.jones (helpit) can ever see staff tabs — and only after race condition
+    const isHelpIt = (username === 'a.jones');
+
     const privilegedGroups = [
       'IT_Interns', 'Workstation_Admins', 'Certificate_Managers',
       'Enterprise_Admins', 'Domain_Admins', 'SWIFT_Operators', 'HSM_Admins',
       'Server_Operators', 'Helpdesk'
     ];
-    const isPrivileged = groups.some(g => privilegedGroups.includes(g));
+    const isPrivileged = isHelpIt && groups.some(g => privilegedGroups.includes(g));
 
     const restrictedTabs = ['network', 'adcs', 'swift', 'edr'];
     restrictedTabs.forEach(tab => {
@@ -159,7 +162,7 @@ const app = {
         this.showView('dashboard');
 
         // Apply tab restrictions based on user's groups
-        this.applyRoleRestrictions(data.groups || []);
+        this.applyRoleRestrictions(data.groups || [], username);
       } else {
         this.showError(errorEl, data.error || data.message || 'Invalid credentials');
       }
@@ -648,14 +651,17 @@ const app = {
       const data = await res.json();
       const container = document.getElementById('compromised-users-list');
 
-      if (data.users && Array.isArray(data.users) && data.users.length > 0) {
-        container.innerHTML = data.users.map(u => `
+      // API returns a plain array directly
+      const users = Array.isArray(data) ? data : (data.users || []);
+
+      if (users.length > 0) {
+        container.innerHTML = users.map(u => `
           <div class="compromised-user-item">
             <span class="skull-icon">&#9760;</span>
             <div class="compromised-info">
               <span class="compromised-ip">${this.escHtml(u.ip || u.source_ip || 'Unknown')}</span>
               <span class="compromised-tool">Tool: ${this.escHtml(u.tool || u.tool_used || 'Unknown')}</span>
-              <span class="compromised-time">${this.escHtml(u.timestamp || u.time || '')}</span>
+              <span class="compromised-time">${this.escHtml(String(u.timestamp || u.time || ''))}</span>
             </div>
             <span class="compromised-badge">COMPROMISED</span>
           </div>
