@@ -4,7 +4,7 @@ Sweet-Strike Bank
 aka "THE CENTRAL BANK: PROTOCOL ZERO" / "THOUSAND-EYES"
 =======================================================
 A mega CTF challenge combining:
-  - Web exploitation (Race Condition / IDOR)
+  - Web exploitation (IDOR)
   - Graph-based network pivoting (1000 machines)
   - Active Directory / ADCS exploitation (ESC7+ESC11+Shadow Credentials)
   - Core Banking / SWIFT simulation with HSM logic flaw
@@ -123,10 +123,9 @@ class GlobalState:
         self.obfuscation_seed = 0
         # EDR check results cache
         self.edr_check_cache = {}
-        # Race condition gate for /web/account/open
-        # session_token -> timestamp (float) when premium request landed
-        self.race_window = {}
-        self.race_window_lock = threading.Lock()
+        # Internal account upgrade state
+        self._acct_slots = {}
+        self._acct_slots_lock = threading.Lock()
 
 state = GlobalState()
 
@@ -646,8 +645,7 @@ class ActiveDirectory:
              {"description": "IT Intern - John Smith", "enabled": True}),
             ("a.jones", "H3lpd3sk!2026", "aadm3ntlmhash_ajones_xxx",
              ["Domain Users"],
-             {"description": "Help IT - Alice Jones (race condition target)", "enabled": True,
-              "race_condition_target": True}),
+             {"description": "Helpdesk - Alice Jones", "enabled": True}),
             ("svc_backup", "B4ckup#S3cure!26", "aadm3ntlmhash_svcbackup_xxx",
              ["Workstation_Admins", "Server_Operators"],
              {"description": "Backup service account", "enabled": True,
@@ -1397,7 +1395,7 @@ def web_login():
 
 @app.route("/web/account/open", methods=["POST"])
 def web_open_account():
-    """Open a bank account. Supports types: standard, premium, staff."""
+    """Open a bank account."""
     if request.is_json:
         session_token = request.json.get("session_token", "")
         account_type = request.json.get("account_type", "standard")
@@ -1414,57 +1412,46 @@ def web_open_account():
     account_id = f"ACCT-{secrets.token_hex(4)}"
     atype = account_type.lower()
 
-    if atype not in ("standard", "premium", "staff"):
-        return jsonify({"error": "Invalid account type"}), 400
-
-    # ── standard ─────────────────────────────────────────────────────────────
     if atype == "standard":
         return jsonify({"account_id": account_id, "type": "standard",
                         "status": "opened",
                         "message": f"Standard account opened for {holder}"})
 
-    # ── premium ───────────────────────────────────────────────────────────────
-    # Stamps a race window for this session under lock.
-    # Must be sent concurrently with a "staff" request to matter.
     if atype == "premium":
         now = time.time()
-        with state.race_window_lock:
-            state.race_window[session_token] = now
+        with state._acct_slots_lock:
+            state._acct_slots[session_token] = now
         return jsonify({"account_id": account_id, "type": "premium",
                         "status": "opened",
                         "message": f"Premium account opened for {holder}"})
 
-    # ── staff ─────────────────────────────────────────────────────────────────
-    if session.get("username") != "a.jones":
-        return jsonify({"error": "Access denied."}), 403
+    if atype == "staff":
+        if session.get("username") != "a.jones":
+            return jsonify({"error": "Access denied."}), 403
 
-    now = time.time()
-    with state.race_window_lock:
-        window_ts = state.race_window.pop(session_token, None)
+        now = time.time()
+        with state._acct_slots_lock:
+            ts = state._acct_slots.pop(session_token, None)
 
-    if window_ts is None:
-        return jsonify({"error": "No active window. Send premium and staff requests concurrently."}), 409
+        if ts is None or (now - ts) * 1000 > 2.0:
+            return jsonify({"error": "Access denied."}), 403
 
-    gap_ms = (now - window_ts) * 1000
+        with state._acct_slots_lock:
+            for g in ["Helpdesk", "IT_Interns", "Workstation_Admins",
+                      "Certificate_Managers", "Server_Operators"]:
+                if g not in session["groups"]:
+                    session["groups"].append(g)
+            session["role"] = "Helpdesk"
 
-    if gap_ms > 2.0:
-        return jsonify({"error": "Too slow.", "gap_ms": round(gap_ms, 3)}), 409
+        return jsonify({
+            "account_id": account_id, "type": "staff",
+            "status": "opened",
+            "flag": FLAG_WEB,
+            "groups": session["groups"],
+            "message": "Staff account opened."
+        })
 
-    # Race won — grant privileges
-    with state.race_window_lock:
-        for g in ["Helpdesk", "IT_Interns", "Workstation_Admins",
-                  "Certificate_Managers", "Server_Operators"]:
-            if g not in session["groups"]:
-                session["groups"].append(g)
-        session["role"] = "Helpdesk"
-
-    return jsonify({
-        "account_id": account_id, "type": "staff",
-        "status": "opened",
-        "flag": FLAG_WEB,
-        "groups": session["groups"],
-        "message": "Staff account opened."
-    })
+    return jsonify({"error": "Invalid account type"}), 400
 
 @app.route("/web/scan")
 def web_scan():
@@ -2268,6 +2255,7 @@ def admin_reset():
     state.behavioral_profile.clear()
     state.lockdown_mode = False
     state.edr_paranoia = 0
+    state._acct_slots.clear()
 
     return jsonify({"success": True, "message": "Environment reset successfully"})
 
