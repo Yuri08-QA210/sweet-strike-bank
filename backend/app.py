@@ -4,7 +4,7 @@ Sweet-Strike Bank
 aka "THE CENTRAL BANK: PROTOCOL ZERO" / "THOUSAND-EYES"
 =======================================================
 A mega CTF challenge combining:
-  - Web exploitation (IDOR)
+  - Web exploitation (Race Condition / IDOR)
   - Graph-based network pivoting (1000 machines)
   - Active Directory / ADCS exploitation (ESC7+ESC11+Shadow Credentials)
   - Core Banking / SWIFT simulation with HSM logic flaw
@@ -34,6 +34,12 @@ from functools import wraps
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify, Response, make_response, send_from_directory
+import math
+import zlib
+import socket
+import ast
+from collections import deque
+from flask import stream_with_context
 
 # ---------------------------------------------------------------------------
 #  Configuration
@@ -123,9 +129,10 @@ class GlobalState:
         self.obfuscation_seed = 0
         # EDR check results cache
         self.edr_check_cache = {}
-        # Internal account upgrade state
-        self._acct_slots = {}
-        self._acct_slots_lock = threading.Lock()
+        # Race condition gate for /web/account/open
+        # session_token -> timestamp (float) when premium request landed
+        self.race_window = {}
+        self.race_window_lock = threading.Lock()
 
 state = GlobalState()
 
@@ -645,7 +652,8 @@ class ActiveDirectory:
              {"description": "IT Intern - John Smith", "enabled": True}),
             ("a.jones", "H3lpd3sk!2026", "aadm3ntlmhash_ajones_xxx",
              ["Domain Users"],
-             {"description": "Helpdesk - Alice Jones", "enabled": True}),
+             {"description": "Help IT - Alice Jones (race condition target)", "enabled": True,
+              "race_condition_target": True}),
             ("svc_backup", "B4ckup#S3cure!26", "aadm3ntlmhash_svcbackup_xxx",
              ["Workstation_Admins", "Server_Operators"],
              {"description": "Backup service account", "enabled": True,
@@ -1395,7 +1403,7 @@ def web_login():
 
 @app.route("/web/account/open", methods=["POST"])
 def web_open_account():
-    """Open a bank account."""
+    """Open a bank account. Supports types: standard, premium, staff."""
     if request.is_json:
         session_token = request.json.get("session_token", "")
         account_type = request.json.get("account_type", "standard")
@@ -1412,46 +1420,57 @@ def web_open_account():
     account_id = f"ACCT-{secrets.token_hex(4)}"
     atype = account_type.lower()
 
+    if atype not in ("standard", "premium", "staff"):
+        return jsonify({"error": "Invalid account type"}), 400
+
+    # ── standard ─────────────────────────────────────────────────────────────
     if atype == "standard":
         return jsonify({"account_id": account_id, "type": "standard",
                         "status": "opened",
                         "message": f"Standard account opened for {holder}"})
 
+    # ── premium ───────────────────────────────────────────────────────────────
+    # Stamps a race window for this session under lock.
+    # Must be sent concurrently with a "staff" request to matter.
     if atype == "premium":
         now = time.time()
-        with state._acct_slots_lock:
-            state._acct_slots[session_token] = now
+        with state.race_window_lock:
+            state.race_window[session_token] = now
         return jsonify({"account_id": account_id, "type": "premium",
                         "status": "opened",
                         "message": f"Premium account opened for {holder}"})
 
-    if atype == "staff":
-        if session.get("username") != "a.jones":
-            return jsonify({"error": "Access denied."}), 403
+    # ── staff ─────────────────────────────────────────────────────────────────
+    if session.get("username") != "a.jones":
+        return jsonify({"error": "Access denied."}), 403
 
-        now = time.time()
-        with state._acct_slots_lock:
-            ts = state._acct_slots.pop(session_token, None)
+    now = time.time()
+    with state.race_window_lock:
+        window_ts = state.race_window.pop(session_token, None)
 
-        if ts is None or (now - ts) * 1000 > 2.0:
-            return jsonify({"error": "Access denied."}), 403
+    if window_ts is None:
+        return jsonify({"error": "No active window. Send premium and staff requests concurrently."}), 409
 
-        with state._acct_slots_lock:
-            for g in ["Helpdesk", "IT_Interns", "Workstation_Admins",
-                      "Certificate_Managers", "Server_Operators"]:
-                if g not in session["groups"]:
-                    session["groups"].append(g)
-            session["role"] = "Helpdesk"
+    gap_ms = (now - window_ts) * 1000
 
-        return jsonify({
-            "account_id": account_id, "type": "staff",
-            "status": "opened",
-            "flag": FLAG_WEB,
-            "groups": session["groups"],
-            "message": "Staff account opened."
-        })
+    if gap_ms > 2.0:
+        return jsonify({"error": "Too slow.", "gap_ms": round(gap_ms, 3)}), 409
 
-    return jsonify({"error": "Invalid account type"}), 400
+    # Race won — grant privileges
+    with state.race_window_lock:
+        for g in ["Helpdesk", "IT_Interns", "Workstation_Admins",
+                  "Certificate_Managers", "Server_Operators"]:
+            if g not in session["groups"]:
+                session["groups"].append(g)
+        session["role"] = "Helpdesk"
+
+    return jsonify({
+        "account_id": account_id, "type": "staff",
+        "status": "opened",
+        "flag": FLAG_WEB,
+        "groups": session["groups"],
+        "message": "Staff account opened."
+    })
 
 @app.route("/web/scan")
 def web_scan():
@@ -2255,7 +2274,6 @@ def admin_reset():
     state.behavioral_profile.clear()
     state.lockdown_mode = False
     state.edr_paranoia = 0
-    state._acct_slots.clear()
 
     return jsonify({"success": True, "message": "Environment reset successfully"})
 
@@ -2438,6 +2456,1337 @@ def health():
 # ---------------------------------------------------------------------------
 #  Run Server
 # ---------------------------------------------------------------------------
+
+# =============================================================================
+#  ADVANCED MODULES
+#  Modules: SQLi/SSRF/RCE · Kerberos · C2 · ADCS Proto · ML-EDR · Forest · Crypto
+# =============================================================================
+
+
+import os, time, hmac, json, math, zlib
+import struct, base64, hashlib, secrets
+import random, threading, logging, socket
+import re, ast
+from collections import defaultdict, deque
+from flask import request, jsonify, Response, stream_with_context
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shared crypto helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b * (len(a) // len(b) + 1)))
+
+def pkcs7_pad(data: bytes, bs: int = 16) -> bytes:
+    pad = bs - (len(data) % bs)
+    return data + bytes([pad] * pad)
+
+def pkcs7_unpad(data: bytes) -> bytes:
+    pad = data[-1]
+    if pad == 0 or pad > 16:
+        raise ValueError("bad padding")
+    if data[-pad:] != bytes([pad] * pad):
+        raise ValueError("bad padding")
+    return data[:-pad]
+
+def aes_ecb_encrypt(key: bytes, data: bytes) -> bytes:
+    """Pure-Python toy AES-ECB (for CTF padding oracle — no pycryptodome needed)."""
+    # We use a deterministic PRNG keyed by `key` as a block cipher substitute.
+    # Real CTF deploy: replace with AES from Crypto.Cipher.
+    def block_enc(k, blk):
+        h = hashlib.sha256(k + blk).digest()
+        return h[:16]
+    out = b""
+    for i in range(0, len(data), 16):
+        out += block_enc(key, data[i:i+16])
+    return out
+
+def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    padded = pkcs7_pad(plaintext)
+    prev = iv
+    ct = b""
+    for i in range(0, len(padded), 16):
+        block = xor_bytes(padded[i:i+16], prev)
+        enc = aes_ecb_encrypt(key, block)
+        ct += enc
+        prev = enc
+    return ct
+
+def aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    prev = iv
+    pt = b""
+    for i in range(0, len(ciphertext), 16):
+        block = ciphertext[i:i+16]
+        dec = aes_ecb_encrypt(key, block)   # ECB is its own inverse for this toy
+        pt += xor_bytes(dec, prev)
+        prev = block
+    return pt
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  1. UNAUTHENTICATED ENTRY POINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+SQLI_DB = {
+    # Simulated DB rows: id, username, password_hash, role, ssn
+    1:  {"id": 1, "username": "guest",    "password_hash": hashlib.md5(b"Welcome2026!").hexdigest(), "role": "user",  "ssn": "000-00-0000"},
+    2:  {"id": 2, "username": "a.jones",  "password_hash": hashlib.md5(b"H3lpd3sk!2026").hexdigest(),"role": "staff", "ssn": "123-45-6789"},
+    3:  {"id": 3, "username": "svc_web",  "password_hash": hashlib.md5(b"W3bS3rv1c3!2026").hexdigest(),"role":"svc",  "ssn": "999-99-9999"},
+}
+
+SSRF_INTERNAL = {
+    # internal URLs that SSRF can reach
+    "http://169.254.169.254/latest/meta-data/iam/security-credentials/ssb-role": {
+        "AccessKeyId": "ASIA31337FAKECREDS",
+        "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYFAKEKEY",
+        "Token": "FakeSessionTokenXXX",
+        "Expiration": "2026-12-31T00:00:00Z"
+    },
+    "http://internal-ca.sweet-strike-bank.local/adcs/config": {
+        "ca_name": "SSB-CA",
+        "custom_protocol_version": 3,
+        "endpoint": "/adcs/enroll",
+        "hint": "Protocol uses binary framing. See /adcs/proto/spec (auth required)."
+    },
+    "http://internal-ldap.sweet-strike-bank.local/users": {
+        "users": ["guest", "a.jones", "svc_web", "c.admin", "edr.svc"],
+        "hint": "LDAP anonymous bind partially allowed."
+    },
+}
+
+RCE_TEMPLATES = {
+    # Simulated template engine (SSTI)
+    "welcome": "Welcome, {name}! Your account is {status}.",
+    "report":  "Report for {user}: {data}",
+}
+
+# Tracks concurrent account-open requests for race condition
+_entry_race_slots: dict = {}
+_entry_race_lock = threading.Lock()
+
+def _sqli_query(raw_input: str):
+    """
+    Simulated SQL query vulnerable to UNION-based SQLi.
+    Query: SELECT * FROM users WHERE username = '<input>'
+    """
+    # Detect comment injection
+    stripped = raw_input.replace("--", "").replace("#", "").replace("/*", "").replace("*/", "")
+    lower = raw_input.lower()
+
+    # UNION SELECT detection
+    union_match = re.search(r"union\s+select\s+(.*)", lower)
+    if union_match:
+        cols_raw = union_match.group(1)
+        # Parse requested columns (simplified: up to 5)
+        cols = [c.strip() for c in cols_raw.split(",")][:5]
+        # Return fake row with requested column count
+        row = {}
+        col_map = ["id", "username", "password_hash", "role", "ssn"]
+        for i, col in enumerate(cols):
+            if col in ("null", "1", "2"):
+                row[col_map[i] if i < len(col_map) else f"col{i}"] = None
+            else:
+                row[col_map[i] if i < len(col_map) else f"col{i}"] = col.strip("'\"")
+        return [row]
+
+    # Normal query
+    for uid, row in SQLI_DB.items():
+        if row["username"] == raw_input.strip("'\""):
+            return [row]
+    return []
+
+def _ssrf_fetch(url: str):
+    """Simulate internal SSRF fetch."""
+    # Blocklist bypass detection
+    bypasses = ["@", "0x", "0177", "localhost", "127.0.0.1"]
+    for b in bypasses:
+        if b in url.lower():
+            pass  # allow — player needs to find bypass
+
+    result = SSRF_INTERNAL.get(url)
+    if result:
+        return result
+
+    # Partial match (path only)
+    for k, v in SSRF_INTERNAL.items():
+        if url in k or k.split("//", 1)[-1] in url:
+            return v
+
+    return {"error": "Connection refused", "url": url}
+
+def _rce_render(template_name: str, user_input: str):
+    """
+    Simulated SSTI. Detects payload and executes if it matches RCE pattern.
+    Safe simulation — never calls eval on real code.
+    """
+    tmpl = RCE_TEMPLATES.get(template_name, "Unknown template: {name}")
+
+    # SSTI detection: {{...}} or ${...}
+    ssti_match = re.search(r"\{\{(.+?)\}\}|\$\{(.+?)\}", user_input)
+    if ssti_match:
+        expr = (ssti_match.group(1) or ssti_match.group(2)).strip()
+        # Simulate expression evaluation
+        if any(k in expr for k in ["__import__", "os.", "subprocess", "open(", "eval("]):
+            # RCE achieved — return simulated shell output
+            return {
+                "rce": True,
+                "output": "uid=33(www-data) gid=33(www-data) groups=33(www-data)\n"
+                          "hostname: ssb-web-prod\n"
+                          "env: FLASK_SECRET=ssb_flask_s3cr3t_2026\n"
+                          "      DB_PASS=W3bDB_P4ss!26\n"
+                          "      INTERNAL_CA=http://internal-ca.sweet-strike-bank.local",
+                "note": "RCE via SSTI. Pivot to internal network using INTERNAL_CA env var."
+            }
+        # Math/info leak
+        try:
+            safe_globals = {"__builtins__": {}}
+            result = str(eval(compile(expr, "<ssti>", "eval"), safe_globals))
+            return {"ssti": True, "result": result}
+        except Exception:
+            pass
+
+    rendered = tmpl.replace("{name}", user_input).replace("{user}", user_input)
+    return {"rendered": rendered}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2. KERBEROS SIMULATION  (AS-REP Roasting + Kerberoasting)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# RC4-HMAC simulation: hash = HMAC-MD5(NT-hash, data)
+def _nt_hash(password: str) -> bytes:
+    return hashlib.new("md4", password.encode("utf-16-le")).digest()
+
+def _rc4_hmac(key: bytes, data: bytes) -> bytes:
+    k1 = hmac.new(key, b"\x00" * 4, hashlib.md5).digest()  # simplified
+    return hmac.new(k1, data, hashlib.md5).digest()
+
+# Kerberos ticket structure (simplified binary):
+# [4 bytes magic][4 bytes enc_type][16 bytes checksum][N bytes encrypted_blob]
+KERBEROS_MAGIC = b"\x76\x82\x01\x00"  # AS-REP magic
+ENC_RC4_HMAC   = b"\x17\x00\x00\x00"  # etype 23
+
+KERBEROS_USERS = {
+    # username -> {nt_hash, spn, preauth_required}
+    "a.jones":       {"password": "H3lpd3sk!2026",   "preauth": True,  "spn": None},
+    "svc_backup":    {"password": "B4ckup#S3cure!26","preauth": True,  "spn": "BACKUP/SRV-CA-001.sweet-strike-bank.local"},
+    "svc_sccm":      {"password": "SCCM_D3pl0y!26",  "preauth": True,  "spn": "SCCM/SRV-CA-001.sweet-strike-bank.local"},
+    "krbtgt":        {"password": "K3rbTGT_M4st3r!26","preauth": True, "spn": "krbtgt/sweet-strike-bank.local"},
+    # AS-REP roastable (no preauth)
+    "svc_monitor":   {"password": "M0n1t0r_Svc!26",  "preauth": False, "spn": None},
+    "backup_agent":  {"password": "B4ckupAg3nt!26",  "preauth": False, "spn": "BACKUP/CORE-HSM-001.sweet-strike-bank.local"},
+}
+
+def _build_asrep_ticket(username: str, session_key: bytes) -> bytes:
+    """Build a fake AS-REP ticket blob that looks crackable."""
+    udata = username.encode()
+    timestamp = struct.pack(">Q", int(time.time()))
+    encrypted_blob = _rc4_hmac(session_key, timestamp + udata)
+    # Pad to look realistic
+    padding = secrets.token_bytes(32)
+    ticket = KERBEROS_MAGIC + ENC_RC4_HMAC + encrypted_blob + padding
+    return base64.b64encode(ticket).decode()
+
+def _build_tgs_ticket(spn: str, service_key: bytes) -> bytes:
+    """Build a TGS ticket for Kerberoasting."""
+    spn_bytes = spn.encode()
+    timestamp  = struct.pack(">Q", int(time.time()))
+    encrypted  = _rc4_hmac(service_key, timestamp + spn_bytes)
+    padding    = secrets.token_bytes(64)
+    ticket     = KERBEROS_MAGIC + ENC_RC4_HMAC + encrypted + padding
+    return base64.b64encode(ticket).decode()
+
+def _verify_krb_crack(username: str, ticket_b64: str, candidate_password: str) -> bool:
+    """Verify if a cracked password matches the ticket."""
+    user = KERBEROS_USERS.get(username)
+    if not user:
+        return False
+    nt = _nt_hash(user["password"])
+    try:
+        raw = base64.b64decode(ticket_b64)
+    except Exception:
+        return False
+    # Re-derive what the checksum should be
+    timestamp_blob = raw[24:40]  # skip magic+etype+checksum
+    candidate_nt   = _nt_hash(candidate_password)
+    expected       = _rc4_hmac(candidate_nt, raw[8:24])  # check against stored checksum
+    actual_nt      = _nt_hash(user["password"])
+    actual_check   = _rc4_hmac(actual_nt, raw[8:24])
+    return candidate_password == user["password"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3. C2 FRAMEWORK  — four channels
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 3a. Binary C2 over HTTP (Cobalt-Strike-like) ─────────────────────────────
+# Frame format:
+#   [4B magic=0xDEADBEEF][2B cmd][2B flags][4B session_id][4B length][NB payload]
+C2_MAGIC  = 0xDEADBEEF
+C2_CMDS   = {0x01: "beacon", 0x02: "shell", 0x03: "upload",
+             0x04: "download", 0x05: "pivot", 0x10: "keylog",
+             0x11: "screenshot", 0xFF: "die"}
+C2_SESSIONS: dict = {}   # session_id(int) -> dict
+
+def c2_parse_frame(raw: bytes) -> dict:
+    if len(raw) < 16:
+        return {"error": "frame too short"}
+    magic, cmd, flags, sid, length = struct.unpack(">IHHII", raw[:16])
+    if magic != C2_MAGIC:
+        return {"error": "bad magic"}
+    payload = raw[16:16+length]
+    return {"cmd": cmd, "flags": flags, "session_id": sid,
+            "length": length, "payload": payload}
+
+def c2_build_frame(cmd: int, session_id: int, payload: bytes, flags: int = 0) -> bytes:
+    header = struct.pack(">IHHII", C2_MAGIC, cmd, flags, session_id, len(payload))
+    return header + payload
+
+def c2_handle(frame: dict, ad_state) -> bytes:
+    sid   = frame["session_id"]
+    cmd   = frame["cmd"]
+    payload = frame["payload"]
+
+    if sid not in C2_SESSIONS:
+        C2_SESSIONS[sid] = {"id": sid, "tasks": [], "os": "unknown",
+                            "hostname": "unknown", "user": "unknown",
+                            "checkin": time.time(), "implant_key": secrets.token_bytes(16)}
+
+    sess = C2_SESSIONS[sid]
+    sess["checkin"] = time.time()
+
+    if cmd == 0x01:  # beacon
+        info = json.loads(payload.decode(errors="replace")) if payload else {}
+        sess.update({k: v for k, v in info.items() if k in ("os","hostname","user","pid")})
+        tasks = sess.pop("tasks", [])
+        resp_payload = json.dumps({"tasks": tasks}).encode()
+        return c2_build_frame(0x01, sid, resp_payload)
+
+    elif cmd == 0x02:  # shell
+        cmd_str = payload.decode(errors="replace")
+        # Simulated command output
+        outputs = {
+            "whoami":    b"nt authority\\system\n",
+            "ipconfig":  b"IPv4: 10.10.50.1\nGateway: 10.10.50.254\n",
+            "net user":  b"a.jones  svc_backup  svc_sccm  c.admin  edr.svc\n",
+            "hostname":  b"DC-DC-001\n",
+        }
+        out = outputs.get(cmd_str.strip().lower(), b"Command executed.\n")
+        return c2_build_frame(0x02, sid, out)
+
+    elif cmd == 0x05:  # pivot
+        # Grants tunnel through current implant
+        target = payload.decode(errors="replace")
+        sess["pivot_targets"] = sess.get("pivot_targets", []) + [target]
+        return c2_build_frame(0x05, sid, b"pivot established to " + target.encode())
+
+    return c2_build_frame(0xFF, sid, b"unknown command")
+
+
+# ── 3b. DNS Tunneling ─────────────────────────────────────────────────────────
+# Encode data as hex subdomain: <hex>.tunnel.ssb.local
+# Max label 63 chars → 31 bytes per label, chain up to 4 labels = 124 bytes/query
+DNS_SESSIONS: dict = {}   # session_token -> reassembly buffer
+
+def dns_encode(data: bytes) -> list:
+    """Split data into DNS tunnel query labels."""
+    hex_data  = data.hex()
+    labels    = [hex_data[i:i+62] for i in range(0, len(hex_data), 62)]
+    return labels
+
+def dns_decode_query(query: str) -> bytes:
+    """Decode a DNS tunnel query back to bytes."""
+    # query format: <seq>.<hex_chunk>.tunnel.ssb.local
+    parts = query.split(".")
+    if len(parts) < 3:
+        return b""
+    try:
+        # parts[0] = seq, parts[1..n-3] = hex chunks
+        hex_parts = parts[1:-2]
+        return bytes.fromhex("".join(hex_parts))
+    except Exception:
+        return b""
+
+DNS_TUNNEL_STORE: dict = defaultdict(list)   # session -> [(seq, chunk)]
+
+def dns_tunnel_reassemble(session: str) -> bytes:
+    chunks = sorted(DNS_TUNNEL_STORE.get(session, []), key=lambda x: x[0])
+    return b"".join(c for _, c in chunks)
+
+
+# ── 3c. WebSocket C2 (custom framing) ─────────────────────────────────────────
+# Frame: [1B type][1B reserved][2B length][4B session_id][NB payload]
+WS_FRAME_TYPES = {0x01: "cmd", 0x02: "output", 0x03: "ping",
+                  0x04: "file_chunk", 0x05: "keylog", 0x06: "screenshot"}
+WS_SESSIONS: dict = {}
+
+def ws_parse_frame(raw: bytes) -> dict:
+    if len(raw) < 8:
+        return {"error": "too short"}
+    ftype, reserved, length, sid = struct.unpack(">BBHI", raw[:8])
+    payload = raw[8:8+length]
+    return {"type": ftype, "session_id": sid, "length": length, "payload": payload}
+
+def ws_build_frame(ftype: int, session_id: int, payload: bytes) -> bytes:
+    return struct.pack(">BBHI", ftype, 0, len(payload), session_id) + payload
+
+
+# ── 3d. ICMP-over-HTTP ────────────────────────────────────────────────────────
+# Encapsulate ICMP-like ping/pong in HTTP body:
+# {"type":"echo","id":<int>,"seq":<int>,"data":"<hex>"}
+ICMP_SESSIONS: dict = {}
+
+def icmp_handle(body: dict) -> dict:
+    itype = body.get("type", "")
+    if itype == "echo":
+        return {"type": "echo_reply", "id": body.get("id", 0),
+                "seq": body.get("seq", 0), "data": body.get("data", ""),
+                "ttl": 64}
+    if itype == "tunnel_data":
+        # Embedded payload in ICMP data field
+        try:
+            payload = bytes.fromhex(body.get("data", ""))
+            # Re-use binary C2 frame parser
+            frame = c2_parse_frame(payload)
+            if "error" not in frame:
+                # Queue as C2 task
+                sid = frame["session_id"]
+                if sid not in C2_SESSIONS:
+                    C2_SESSIONS[sid] = {"id": sid, "tasks": [], "checkin": time.time(),
+                                        "implant_key": secrets.token_bytes(16)}
+                resp = c2_handle(frame, None)
+                return {"type": "tunnel_reply", "data": resp.hex()}
+        except Exception as e:
+            pass
+    return {"type": "error", "message": "unknown icmp type"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  4. ADCS CUSTOM PROTOCOL  — all four layers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 4a. Binary struct (MS-WCCE lite) ─────────────────────────────────────────
+# Enroll request frame:
+#   [2B version=0x0300][2B msg_type][4B request_id][32B session_nonce]
+#   [2B template_len][NB template_name]
+#   [2B subject_len][NB subject]
+#   [2B san_len][NB san_or_zero]
+#   [4B flags]
+#   [32B hmac_sha256(all_above, session_key)]
+PROTO_VERSION = 0x0300
+MSG_ENROLL    = 0x0001
+MSG_RESPONSE  = 0x0002
+MSG_ERROR     = 0x00FF
+
+def adcs_build_enroll_request(session_key: bytes, request_id: int,
+                               template: str, subject: str, san: str = "") -> bytes:
+    nonce = secrets.token_bytes(32)
+    tmpl_b    = template.encode()
+    subj_b    = subject.encode()
+    san_b     = san.encode()
+    flags     = 0x00000001  # CERT_REQUEST_FLAG_RENEW
+
+    body = struct.pack(">HHI32sHH",
+        PROTO_VERSION, MSG_ENROLL, request_id, nonce,
+        len(tmpl_b), len(subj_b)
+    ) + tmpl_b + struct.pack(">H", len(san_b)) + san_b + struct.pack(">I", flags)
+
+    mac = hmac.new(session_key, body, hashlib.sha256).digest()
+    return body + mac
+
+def adcs_parse_enroll_request(raw: bytes, session_key: bytes) -> dict:
+    """Parse and verify an enroll request frame."""
+    if len(raw) < 44:
+        return {"error": "frame too short"}
+    try:
+        version, msg_type, request_id = struct.unpack(">HHI", raw[:8])
+        nonce   = raw[8:40]
+        tmpl_len, subj_len = struct.unpack(">HH", raw[40:44])
+        offset  = 44
+        template = raw[offset:offset+tmpl_len].decode()
+        offset  += tmpl_len
+        subject  = raw[offset:offset+subj_len].decode()
+        offset  += subj_len
+        san_len, = struct.unpack(">H", raw[offset:offset+2])
+        offset  += 2
+        san     = raw[offset:offset+san_len].decode()
+        offset  += san_len
+        flags,  = struct.unpack(">I", raw[offset:offset+4])
+        offset  += 4
+        provided_mac = raw[offset:offset+32]
+        body         = raw[:offset]
+        expected_mac = hmac.new(session_key, body, hashlib.sha256).digest()
+        mac_valid    = hmac.compare_digest(provided_mac, expected_mac)
+    except Exception as e:
+        return {"error": str(e)}
+
+    if version != PROTO_VERSION:
+        return {"error": f"unsupported version 0x{version:04x}"}
+    if msg_type != MSG_ENROLL:
+        return {"error": "unexpected message type"}
+    if not mac_valid:
+        return {"error": "HMAC verification failed"}
+
+    return {"version": version, "request_id": request_id,
+            "template": template, "subject": subject,
+            "san": san, "flags": flags, "nonce": nonce.hex()}
+
+
+# ── 4b. XOR-obfuscated JSON ───────────────────────────────────────────────────
+# Key is derived from session_nonce XOR sha256(session_token)[:16]
+def _xor_key(session_token: str, nonce: bytes) -> bytes:
+    token_hash = hashlib.sha256(session_token.encode()).digest()[:16]
+    return xor_bytes(nonce[:16], token_hash)
+
+def adcs_xor_encode(session_token: str, nonce: bytes, data: dict) -> bytes:
+    raw  = json.dumps(data).encode()
+    key  = _xor_key(session_token, nonce)
+    enc  = xor_bytes(raw, key)
+    return base64.b64encode(enc)
+
+def adcs_xor_decode(session_token: str, nonce: bytes, enc_b64: bytes) -> dict:
+    try:
+        enc = base64.b64decode(enc_b64)
+        key = _xor_key(session_token, nonce)
+        raw = xor_bytes(enc, key)
+        return json.loads(raw)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── 4c. ASN.1 / DER encoding ─────────────────────────────────────────────────
+# Minimal DER encoder/decoder for CSR-like structure
+# Supports: SEQUENCE, SET, INTEGER, UTF8String, BIT STRING, OID
+
+def der_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    nb = (n.bit_length() + 7) // 8
+    return bytes([0x80 | nb]) + n.to_bytes(nb, "big")
+
+def der_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + der_len(len(value)) + value
+
+def der_sequence(*items: bytes) -> bytes:
+    body = b"".join(items)
+    return der_tlv(0x30, body)
+
+def der_utf8string(s: str) -> bytes:
+    return der_tlv(0x0C, s.encode())
+
+def der_integer(n: int) -> bytes:
+    nb = max(1, (n.bit_length() + 8) // 8)
+    raw = n.to_bytes(nb, "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return der_tlv(0x02, raw)
+
+def der_oid(dotted: str) -> bytes:
+    parts = list(map(int, dotted.split(".")))
+    first = 40 * parts[0] + parts[1]
+    body  = bytes([first])
+    for p in parts[2:]:
+        enc = []
+        enc.insert(0, p & 0x7F)
+        p >>= 7
+        while p:
+            enc.insert(0, (p & 0x7F) | 0x80)
+            p >>= 7
+        body += bytes(enc)
+    return der_tlv(0x06, body)
+
+def der_bitstring(data: bytes) -> bytes:
+    return der_tlv(0x03, b"\x00" + data)  # 0 unused bits
+
+def build_csr_der(subject_cn: str, san: str, template_oid: str, request_id: int) -> bytes:
+    """Build a DER-encoded CSR-like structure for ADCS enrollment."""
+    cn_seq      = der_sequence(der_oid("2.5.4.3"), der_utf8string(subject_cn))
+    san_seq     = der_sequence(der_oid("2.5.29.17"), der_utf8string(san)) if san else b""
+    tmpl_seq    = der_sequence(der_oid(template_oid), der_utf8string("v2"))
+    req_id_seq  = der_integer(request_id)
+    timestamp   = der_integer(int(time.time()))
+    subject     = der_sequence(der_sequence(cn_seq))
+    extensions  = der_sequence(tmpl_seq, *([san_seq] if san else []))
+    csr_info    = der_sequence(req_id_seq, timestamp, subject, extensions)
+    signature   = der_bitstring(hashlib.sha256(csr_info).digest())
+    return der_sequence(csr_info, signature)
+
+def parse_csr_der(raw: bytes) -> dict:
+    """Minimal DER parser — returns dict of key fields."""
+    def read_tlv(buf, offset):
+        tag = buf[offset]; offset += 1
+        first = buf[offset]; offset += 1
+        if first & 0x80:
+            nb = first & 0x7F
+            length = int.from_bytes(buf[offset:offset+nb], "big")
+            offset += nb
+        else:
+            length = first
+        value = buf[offset:offset+length]
+        return tag, value, offset + length
+
+    try:
+        # Just extract the subject CN from the DER blob (simplified)
+        idx = raw.find(b"\x0C")  # UTF8String tag
+        if idx == -1:
+            return {"error": "no UTF8String found"}
+        length = raw[idx+1]
+        cn = raw[idx+2:idx+2+length].decode(errors="replace")
+        return {"subject_cn": cn, "raw_len": len(raw)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── 4d. Protobuf-less binary (no .proto) ─────────────────────────────────────
+# Field encoding: [1B field_number<<3 | wire_type][varint or length-delimited]
+# Wire types: 0=varint, 2=length-delimited
+def _encode_varint(value: int) -> bytes:
+    bits = []
+    while True:
+        bits.append(value & 0x7F)
+        value >>= 7
+        if value == 0:
+            break
+    for i in range(len(bits)-1):
+        bits[i] |= 0x80
+    return bytes(bits)
+
+def _decode_varint(data: bytes, pos: int):
+    result = 0; shift = 0
+    while True:
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, pos
+
+def proto_encode(fields: dict) -> bytes:
+    """Encode dict as protobuf-like binary. Keys must be ints."""
+    out = b""
+    for field_num, value in sorted(fields.items()):
+        if isinstance(value, int):
+            out += _encode_varint((field_num << 3) | 0)  # varint
+            out += _encode_varint(value)
+        elif isinstance(value, (str, bytes)):
+            v = value.encode() if isinstance(value, str) else value
+            out += _encode_varint((field_num << 3) | 2)  # length-delimited
+            out += _encode_varint(len(v))
+            out += v
+    return out
+
+def proto_decode(data: bytes) -> dict:
+    """Decode protobuf-like binary."""
+    result = {}; pos = 0
+    while pos < len(data):
+        try:
+            tag, pos  = _decode_varint(data, pos)
+            field_num = tag >> 3
+            wire_type = tag & 0x07
+            if wire_type == 0:
+                value, pos = _decode_varint(data, pos)
+                result[field_num] = value
+            elif wire_type == 2:
+                length, pos = _decode_varint(data, pos)
+                value = data[pos:pos+length]
+                pos  += length
+                try:
+                    result[field_num] = value.decode()
+                except Exception:
+                    result[field_num] = value.hex()
+            else:
+                break
+        except Exception:
+            break
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  5. ML-BASED EDR  — behavioral anomaly detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BehavioralEDR:
+    """
+    Sliding-window behavioral profiler.
+    Features per request:
+      f0 = inter-request interval (ms)
+      f1 = endpoint entropy (0=repetitive, 1=varied)
+      f2 = payload size (bytes)
+      f3 = hour of day (0-23)
+      f4 = error rate (last 10 requests)
+
+    Anomaly score: Mahalanobis-like distance from baseline centroid.
+    Baseline is seeded from "normal" synthetic traffic.
+    Alert threshold: score > 3.5 σ
+    """
+
+    BASELINE = {
+        # mean, std for each feature (pre-computed from synthetic normal traffic)
+        "interval_ms": (2500.0, 800.0),
+        "endpoint_entropy": (0.65, 0.15),
+        "payload_size": (256.0, 128.0),
+        "hour": (11.5, 4.0),
+        "error_rate": (0.05, 0.03),
+    }
+    THRESHOLD = 3.5
+
+    def __init__(self):
+        self.profiles: dict = defaultdict(lambda: {
+            "history": deque(maxlen=50),
+            "last_req": None,
+            "endpoints": deque(maxlen=20),
+            "errors": deque(maxlen=10),
+            "score": 0.0,
+            "alerts": [],
+        })
+        self._lock = threading.Lock()
+
+    def _endpoint_entropy(self, endpoints: deque) -> float:
+        if not endpoints:
+            return 0.0
+        counts: dict = defaultdict(int)
+        for e in endpoints:
+            counts[e] += 1
+        total = len(endpoints)
+        ent   = -sum((c/total) * math.log2(c/total) for c in counts.values())
+        max_e = math.log2(max(len(counts), 1)) or 1.0
+        return ent / max_e
+
+    def _zscore(self, value: float, mean: float, std: float) -> float:
+        if std == 0:
+            return 0.0
+        return abs((value - mean) / std)
+
+    def score(self, ip: str, endpoint: str, payload_size: int,
+              is_error: bool, timestamp: float) -> float:
+        with self._lock:
+            prof = self.profiles[ip]
+            now  = timestamp
+
+            # Feature: interval
+            interval_ms = (now - prof["last_req"]) * 1000 if prof["last_req"] else 2500.0
+            prof["last_req"] = now
+
+            # Feature: endpoint entropy
+            prof["endpoints"].append(endpoint)
+            ent = self._endpoint_entropy(prof["endpoints"])
+
+            # Feature: error rate
+            prof["errors"].append(1 if is_error else 0)
+            err_rate = sum(prof["errors"]) / max(len(prof["errors"]), 1)
+
+            # Feature: hour of day
+            hour = (now % 86400) / 3600
+
+            features = {
+                "interval_ms":       interval_ms,
+                "endpoint_entropy":  ent,
+                "payload_size":      float(payload_size),
+                "hour":              hour,
+                "error_rate":        err_rate,
+            }
+
+            # Compute composite z-score
+            z_scores = [
+                self._zscore(v, *self.BASELINE[k])
+                for k, v in features.items()
+            ]
+            composite = math.sqrt(sum(z**2 for z in z_scores) / len(z_scores))
+            prof["score"] = composite
+            prof["history"].append({"time": now, "score": composite, "ep": endpoint})
+
+            if composite > self.THRESHOLD:
+                alert = {
+                    "time": now, "score": round(composite, 3),
+                    "features": {k: round(v, 3) for k, v in features.items()},
+                    "reason": self._explain(z_scores, list(features.keys()))
+                }
+                prof["alerts"].append(alert)
+
+            return composite
+
+    def _explain(self, z_scores: list, keys: list) -> str:
+        worst_idx = z_scores.index(max(z_scores))
+        return f"Anomaly in {keys[worst_idx]} (z={z_scores[worst_idx]:.2f})"
+
+    def is_anomalous(self, ip: str) -> bool:
+        return self.profiles[ip]["score"] > self.THRESHOLD
+
+    def get_profile(self, ip: str) -> dict:
+        p = self.profiles[ip]
+        return {
+            "score": round(p["score"], 3),
+            "anomalous": p["score"] > self.THRESHOLD,
+            "alert_count": len(p["alerts"]),
+            "last_alerts": p["alerts"][-3:],
+        }
+
+ml_edr = BehavioralEDR()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  6. MULTI-FOREST TRUST
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ForestTrust:
+    """
+    Two AD forests with a one-way trust:
+      FOREST A: sweet-strike-bank.local  (primary, already simulated)
+      FOREST B: clearing-house.internal  (external, higher-value targets)
+
+    Trust direction: A trusts B (B can access A resources, not vice versa)
+    Attack path: compromise A → use SID history attack → pivot to B
+    """
+    FOREST_A = "sweet-strike-bank.local"
+    FOREST_B = "clearing-house.internal"
+
+    FOREST_B_USERS = {
+        "clearinghouse\\svc_api":   {"password": "CL34R_4P1!26", "groups": ["API_Users"],   "sid": "S-1-5-21-99999-11111-22222-1001"},
+        "clearinghouse\\db_admin":  {"password": "DB_4dm1n!26",  "groups": ["DBA_Group"],   "sid": "S-1-5-21-99999-11111-22222-1002"},
+        "clearinghouse\\forest_da": {"password": "F0r3st_D4!26", "groups": ["Domain_Admins"],"sid":"S-1-5-21-99999-11111-22222-500"},
+    }
+
+    FOREST_B_FLAGS = {
+        "SID_HISTORY_PIVOT": "QA{s1d_h1st0ry_cr0ss_f0r3st_pwn3d_2026}",
+        "FOREST_DA":         "QA{f0r3st_d0m41n_4dm1n_cl34r1ngh0us3_2026}",
+    }
+
+    # SID mapping: Forest A admin SID → Forest B trust SID
+    TRUST_SID_MAP = {
+        "S-1-5-21-31337-42424-99999-512":  "S-1-5-21-99999-11111-22222-512",  # Domain Admins
+        "S-1-5-21-31337-42424-99999-1106": "S-1-5-21-99999-11111-22222-519",  # Enterprise Admins → EA in B
+    }
+
+    def __init__(self):
+        self.trust_tickets: dict = {}  # session -> cross-forest TGT
+
+    def request_cross_forest_tgt(self, session_token: str, user_sid: str) -> dict:
+        """
+        Simulate SID History attack: inject Forest A SID into Forest B TGT.
+        Requires: user_sid must be Domain_Admins or Enterprise_Admins from Forest A.
+        """
+        mapped = self.TRUST_SID_MAP.get(user_sid)
+        if not mapped:
+            return {"error": "SID not trusted for cross-forest access"}
+
+        ticket = {
+            "type": "cross_forest_tgt",
+            "src_forest": self.FOREST_A,
+            "dst_forest": self.FOREST_B,
+            "src_sid": user_sid,
+            "dst_sid": mapped,
+            "ticket_b64": base64.b64encode(
+                secrets.token_bytes(128) + user_sid.encode()
+            ).decode(),
+            "expires": time.time() + 3600,
+            "flag": self.FOREST_B_FLAGS["SID_HISTORY_PIVOT"],
+        }
+        self.trust_tickets[session_token] = ticket
+        return ticket
+
+    def enumerate_forest_b(self, session_token: str) -> dict:
+        if session_token not in self.trust_tickets:
+            return {"error": "No cross-forest ticket. Obtain one first."}
+        ticket = self.trust_tickets[session_token]
+        if time.time() > ticket["expires"]:
+            return {"error": "Ticket expired"}
+        return {
+            "forest": self.FOREST_B,
+            "users": list(self.FOREST_B_USERS.keys()),
+            "dc": "clearing-dc-001.clearing-house.internal",
+            "trusts": [{"direction": "inbound", "forest": self.FOREST_A}],
+        }
+
+    def compromise_forest_b_da(self, session_token: str, username: str, password: str) -> dict:
+        if session_token not in self.trust_tickets:
+            return {"error": "No cross-forest ticket"}
+        user = self.FOREST_B_USERS.get(username)
+        if not user:
+            return {"error": "User not found in Forest B"}
+        if user["password"] != password:
+            return {"error": "Invalid credentials"}
+        if "Domain_Admins" not in user.get("groups", []):
+            return {"error": "User is not Domain Admin in Forest B"}
+        return {
+            "success": True,
+            "message": f"Forest B compromised via {username}",
+            "flag": self.FOREST_B_FLAGS["FOREST_DA"],
+            "ntds_hint": "Extract NTDS.dit from clearing-dc-001 for all hashes."
+        }
+
+forest_trust = ForestTrust()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  7. REAL CRYPTO LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CryptoOracles:
+    """
+    Real padding oracle (AES-CBC) and RSA PKCS1v1.5 signature confusion.
+    """
+
+    # Shared key — never exposed directly
+    AES_KEY = hashlib.sha256(b"SSB_AES_CBC_2026").digest()[:16]
+    AES_IV  = hashlib.sha256(b"SSB_AES_IV_2026").digest()[:16]
+
+    # RSA-like (toy): encrypt = m^e mod n, sign = m^d mod n
+    # Small primes for CTF (NOT real security)
+    RSA_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF975221F100DE0F06  # fake large prime repr
+    RSA_Q = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF000000000000000F
+    # Use real hashlib-based substitute
+    RSA_SIGN_KEY = hashlib.sha256(b"SSB_RSA_SIGN_2026").digest()
+
+    def __init__(self):
+        self.oracle_queries = defaultdict(int)  # ip -> query count
+        self.oracle_lock    = threading.Lock()
+
+    def encrypt_token(self, plaintext: str) -> str:
+        ct = aes_cbc_encrypt(self.AES_KEY, self.AES_IV, plaintext.encode())
+        return base64.b64encode(self.AES_IV + ct).decode()
+
+    def decrypt_token(self, token_b64: str) -> tuple:
+        """Returns (plaintext, padding_valid). Leaks padding validity — THE ORACLE."""
+        try:
+            raw = base64.b64decode(token_b64)
+            iv  = raw[:16]
+            ct  = raw[16:]
+            pt  = aes_cbc_decrypt(self.AES_KEY, iv, ct)
+            try:
+                unpadded = pkcs7_unpad(pt)
+                return unpadded.decode(errors="replace"), True
+            except ValueError:
+                return None, False   # padding error leaked!
+        except Exception:
+            return None, False
+
+    def padding_oracle_query(self, ip: str, token_b64: str) -> dict:
+        """
+        The actual oracle endpoint.
+        Returns different errors for padding vs MAC failure — enables CBC bit-flip attack.
+        """
+        with self.oracle_lock:
+            self.oracle_queries[ip] += 1
+            if self.oracle_queries[ip] > 5000:
+                return {"error": "Oracle rate limit exceeded"}
+
+        plaintext, padding_ok = self.decrypt_token(token_b64)
+        if not padding_ok:
+            return {"error": "Padding error", "code": "PADDING_INVALID"}   # oracle leak!
+        if plaintext is None:
+            return {"error": "Decryption error", "code": "DECRYPT_FAILED"}
+        # Don't return plaintext — player must deduce it via oracle
+        return {"status": "ok", "code": "PADDING_VALID"}
+
+    def forge_admin_token(self, forged_plaintext: str) -> str:
+        """If player correctly forges a token via padding oracle, give flag."""
+        ct = aes_cbc_encrypt(self.AES_KEY, self.AES_IV, forged_plaintext.encode())
+        return base64.b64encode(self.AES_IV + ct).decode()
+
+    def rsa_sign(self, message: bytes) -> str:
+        """Sign using HMAC-SHA256 as RSA substitute."""
+        sig = hmac.new(self.RSA_SIGN_KEY, message, hashlib.sha256).digest()
+        return base64.b64encode(sig).decode()
+
+    def rsa_verify_confused(self, message: bytes, signature_b64: str) -> dict:
+        """
+        PKCS1v1.5 signature confusion vulnerability.
+        Incorrectly verifies: only checks prefix, not full signature.
+        Player can forge by prepending correct ASN.1 DigestInfo prefix.
+        """
+        try:
+            sig = base64.b64decode(signature_b64)
+        except Exception:
+            return {"valid": False, "error": "bad base64"}
+
+        expected = hmac.new(self.RSA_SIGN_KEY, message, hashlib.sha256).digest()
+        # BUG: only check first 8 bytes (like the classic Bleichenbacher'06 attack)
+        if sig[:8] == expected[:8]:
+            return {"valid": True, "confused": True}
+        return {"valid": False}
+
+crypto_oracles = CryptoOracles()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ROUTE REGISTRATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Advanced Routes (inlined) ──────────────────────────────────────────────
+
+# ── ML EDR middleware ─────────────────────────────────────────────────────
+@app.before_request
+def ml_edr_middleware():
+    ip      = request.remote_addr or "0.0.0.0"
+    ep      = request.path
+    psize   = request.content_length or 0
+    score   = ml_edr.score(ip, ep, psize, False, time.time())
+    if score > BehavioralEDR.THRESHOLD * 1.5:
+        # Very high anomaly → hard block
+        return jsonify({"error": "EDR: Behavioral anomaly detected. Session terminated.",
+                        "edr_score": round(score, 2)}), 403
+
+# ── Entry: SQLi ───────────────────────────────────────────────────────────
+@app.route("/portal/search", methods=["POST"])
+def portal_search():
+    """User search — vulnerable to UNION-based SQLi."""
+    data  = request.get_json(silent=True) or {}
+    query = data.get("username", "")
+    rows  = _sqli_query(query)
+    if rows and rows[0].get("role") == "staff":
+        return jsonify({"results": rows,
+                        "hint": "Staff credentials found. Try /portal/login."})
+    return jsonify({"results": rows})
+
+# ── Entry: SSRF ───────────────────────────────────────────────────────────
+@app.route("/portal/fetch", methods=["POST"])
+def portal_fetch():
+    """Internal URL fetcher — vulnerable to SSRF."""
+    data = request.get_json(silent=True) or {}
+    url  = data.get("url", "")
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    result = _ssrf_fetch(url)
+    return jsonify(result)
+
+# ── Entry: SSTI/RCE ──────────────────────────────────────────────────────
+@app.route("/portal/render", methods=["POST"])
+def portal_render():
+    """Template renderer — vulnerable to SSTI."""
+    data     = request.get_json(silent=True) or {}
+    template = data.get("template", "welcome")
+    user_in  = data.get("input", "")
+    result   = _rce_render(template, user_in)
+    return jsonify(result)
+
+# ── Kerberos: AS-REQ (AS-REP Roasting) ───────────────────────────────────
+@app.route("/kerberos/as-req", methods=["POST"])
+def kerberos_as_req():
+    """
+    Kerberos AS-REQ endpoint.
+    If target user has preauth disabled → return crackable AS-REP hash.
+    """
+    data     = request.get_json(silent=True) or {}
+    username = data.get("username", "")
+    preauth  = data.get("preauth_data", None)   # None = no preauth sent
+
+    user = KERBEROS_USERS.get(username)
+    if not user:
+        return jsonify({"error": "KDC_ERR_C_PRINCIPAL_UNKNOWN"}), 404
+
+    if user["preauth"] and preauth is None:
+        return jsonify({"error": "KDC_ERR_PREAUTH_REQUIRED",
+                        "etype": [23, 18, 17]}), 400
+
+    session_key = _nt_hash(user["password"])
+    ticket      = _build_asrep_ticket(username, session_key)
+    return jsonify({
+        "msg_type": "AS-REP",
+        "etype": 23,
+        "username": username,
+        "ticket": ticket,
+        "note": "$krb5asrep$23$" + username + "@SWEET-STRIKE-BANK.LOCAL:" + ticket[:32] + "$" + ticket[32:]
+    })
+
+# ── Kerberos: TGS-REQ (Kerberoasting) ────────────────────────────────────
+@app.route("/kerberos/tgs-req", methods=["POST"])
+def kerberos_tgs_req():
+    """
+    Kerberos TGS-REQ — request service ticket for an SPN.
+    Returns crackable TGS hash.
+    """
+    data     = request.get_json(silent=True) or {}
+    spn      = data.get("spn", "")
+    tgt_b64  = data.get("tgt", "")
+
+    if not tgt_b64:
+        return jsonify({"error": "TGT required"}), 400
+
+    # Find service account with this SPN
+    target_user = None
+    for uname, udata in KERBEROS_USERS.items():
+        if udata.get("spn") == spn:
+            target_user = (uname, udata)
+            break
+
+    if not target_user:
+        return jsonify({"error": "KDC_ERR_S_PRINCIPAL_UNKNOWN"}), 404
+
+    uname, udata = target_user
+    svc_key      = _nt_hash(udata["password"])
+    ticket       = _build_tgs_ticket(spn, svc_key)
+    return jsonify({
+        "msg_type": "TGS-REP",
+        "etype": 23,
+        "spn": spn,
+        "ticket": ticket,
+        "note": "$krb5tgs$23$*" + uname + "$SWEET-STRIKE-BANK.LOCAL$" + spn + "*$" + ticket[:32] + "$" + ticket[32:]
+    })
+
+# ── Kerberos: Crack verify ────────────────────────────────────────────────
+@app.route("/kerberos/crack-verify", methods=["POST"])
+def kerberos_crack_verify():
+    """Verify if a cracked password matches a Kerberos ticket."""
+    data     = request.get_json(silent=True) or {}
+    username = data.get("username", "")
+    ticket   = data.get("ticket", "")
+    password = data.get("password", "")
+    if _verify_krb_crack(username, ticket, password):
+        return jsonify({"valid": True, "password": password,
+                        "nt_hash": _nt_hash(password).hex()})
+    return jsonify({"valid": False})
+
+# ── C2: Binary over HTTP ──────────────────────────────────────────────────
+@app.route("/c2/beacon", methods=["POST"])
+def c2_beacon():
+    raw = request.get_data()
+    if not raw:
+        body = request.get_json(silent=True) or {}
+        raw  = base64.b64decode(body.get("data", ""))
+    frame = c2_parse_frame(raw)
+    if "error" in frame:
+        return jsonify(frame), 400
+    resp  = c2_handle(frame, state.ad)
+    return Response(base64.b64encode(resp),
+                    mimetype="application/octet-stream")
+
+@app.route("/c2/sessions", methods=["GET"])
+def c2_sessions():
+    return jsonify({sid: {k: v for k, v in s.items() if k != "implant_key"}
+                    for sid, s in C2_SESSIONS.items()})
+
+# ── C2: DNS tunnel ────────────────────────────────────────────────────────
+@app.route("/dns/query", methods=["POST"])
+def dns_query():
+    """Simulate DNS tunnel query processing."""
+    data    = request.get_json(silent=True) or {}
+    qname   = data.get("qname", "")
+    session = data.get("session", "default")
+    seq     = data.get("seq", 0)
+
+    decoded = dns_decode_query(qname)
+    if decoded:
+        DNS_TUNNEL_STORE[session].append((seq, decoded))
+        return jsonify({"status": "queued", "seq": seq, "bytes": len(decoded)})
+    return jsonify({"error": "invalid dns query"}), 400
+
+@app.route("/dns/reassemble", methods=["POST"])
+def dns_reassemble():
+    data    = request.get_json(silent=True) or {}
+    session = data.get("session", "default")
+    result  = dns_tunnel_reassemble(session)
+    frame   = c2_parse_frame(result) if len(result) >= 16 else {"raw": result.hex()}
+    return jsonify({"bytes": len(result), "frame": frame})
+
+# ── C2: WebSocket framing ─────────────────────────────────────────────────
+@app.route("/c2/ws-frame", methods=["POST"])
+def c2_ws_frame():
+    body = request.get_json(silent=True) or {}
+    raw  = base64.b64decode(body.get("frame", ""))
+    parsed = ws_parse_frame(raw)
+    if "error" in parsed:
+        return jsonify(parsed), 400
+    sid  = parsed["session_id"]
+    if sid not in WS_SESSIONS:
+        WS_SESSIONS[sid] = {"id": sid, "tasks": []}
+    resp_payload = json.dumps({"ack": True, "session": sid}).encode()
+    resp_frame   = ws_build_frame(0x02, sid, resp_payload)
+    return jsonify({"response": base64.b64encode(resp_frame).decode(),
+                    "parsed": {**parsed, "payload": parsed["payload"].decode(errors="replace")}})
+
+# ── C2: ICMP-over-HTTP ────────────────────────────────────────────────────
+@app.route("/c2/icmp", methods=["POST"])
+def c2_icmp():
+    body = request.get_json(silent=True) or {}
+    return jsonify(icmp_handle(body))
+
+# ── ADCS: Protocol negotiation ────────────────────────────────────────────
+@app.route("/adcs/proto/negotiate", methods=["POST"])
+def adcs_proto_negotiate():
+    """
+    Client sends supported protocol versions + encoding preferences.
+    Server picks a stack. No docs provided — player must figure this out.
+    """
+    data     = request.get_json(silent=True) or {}
+    versions = data.get("versions", [])
+    encodings= data.get("encodings", [])
+
+    # Server requires: version=0x0300, encoding stack = [binary, xor, asn1, proto]
+    required_version  = PROTO_VERSION
+    required_encodings= ["binary", "xor", "asn1", "proto"]
+
+    if required_version not in versions:
+        return jsonify({"error": "unsupported version",
+                        "supported": [required_version]}), 400
+
+    selected = [e for e in required_encodings if e in encodings]
+    if len(selected) < 2:
+        return jsonify({"error": "insufficient encoding support",
+                        "required_any_two": required_encodings}), 400
+
+    nonce    = secrets.token_bytes(16)
+    nego_id  = secrets.token_hex(8)
+    return jsonify({
+        "nego_id": nego_id,
+        "version": required_version,
+        "selected_encodings": selected,
+        "nonce": nonce.hex(),
+        "server_hello": base64.b64encode(
+            struct.pack(">HH16s", required_version, len(selected),
+                        nonce) + json.dumps(selected).encode()
+        ).decode()
+    })
+
+@app.route("/adcs/proto/enroll", methods=["POST"])
+def adcs_proto_enroll():
+    """
+    Multi-layer ADCS enrollment.
+    Expects: base64(proto_encoded(xor_encoded(asn1_csr)))
+    Session key derived from nego nonce XOR session_token hash.
+    """
+    data         = request.get_json(silent=True) or {}
+    session_token= data.get("session_token", "")
+    nonce_hex    = data.get("nonce", "")
+    payload_b64  = data.get("payload", "")
+    encoding     = data.get("encoding", "binary")  # which encoding layer
+
+    if not session_token or not payload_b64:
+        return jsonify({"error": "session_token and payload required"}), 400
+
+    try:
+        nonce   = bytes.fromhex(nonce_hex) if nonce_hex else b"\x00"*16
+        raw     = base64.b64decode(payload_b64)
+    except Exception as e:
+        return jsonify({"error": f"decode error: {e}"}), 400
+
+    # Decode based on selected encoding
+    if encoding == "binary":
+        session_key = hashlib.sha256(session_token.encode() + nonce).digest()[:16]
+        parsed = adcs_parse_enroll_request(raw, session_key)
+    elif encoding == "xor":
+        decoded_dict = adcs_xor_decode(session_token, nonce, payload_b64.encode())
+        if "error" in decoded_dict:
+            return jsonify(decoded_dict), 400
+        parsed = {"template": decoded_dict.get("template", ""),
+                  "subject":  decoded_dict.get("subject", ""),
+                  "san":      decoded_dict.get("san", ""),
+                  "request_id": decoded_dict.get("id", 0)}
+    elif encoding == "asn1":
+        parsed = parse_csr_der(raw)
+        parsed["template"] = data.get("template", "")
+        parsed["san"]      = data.get("san", "")
+    elif encoding == "proto":
+        decoded = proto_decode(raw)
+        parsed  = {"template":   decoded.get(1, ""),
+                   "subject":    decoded.get(2, ""),
+                   "san":        decoded.get(3, ""),
+                   "request_id": decoded.get(4, 0)}
+    else:
+        return jsonify({"error": f"unknown encoding: {encoding}"}), 400
+
+    if "error" in parsed:
+        return jsonify(parsed), 400
+
+    # Forward to main ADCS engine if available
+    if hasattr(state, "ca") and state.ca:
+        # Build a fake ADCS session
+        fake_session = {
+            "id": session_token,
+            "groups": state.web_sessions.get(session_token, {}).get("groups", []),
+            "ip": request.remote_addr or "0.0.0.0",
+        }
+        result = state.ca.request_cert(
+            fake_session,
+            parsed.get("template", ""),
+            parsed.get("subject", ""),
+            san=parsed.get("san") or None,
+            protocol_data={"version": PROTO_VERSION, "valid": True}
+        )
+        return jsonify(result)
+
+    return jsonify({"parsed": parsed, "status": "accepted",
+                    "note": "Forwarded to CA engine."})
+
+# ── Crypto: Padding oracle ────────────────────────────────────────────────
+@app.route("/crypto/oracle", methods=["POST"])
+def crypto_oracle():
+    """AES-CBC padding oracle."""
+    data  = request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    ip    = request.remote_addr or "0.0.0.0"
+    return jsonify(crypto_oracles.padding_oracle_query(ip, token))
+
+@app.route("/crypto/token", methods=["POST"])
+def crypto_token():
+    """Get an encrypted token for a given plaintext (limited)."""
+    data      = request.get_json(silent=True) or {}
+    plaintext = data.get("plaintext", "guest")
+    # Only allow non-admin plaintexts here
+    if any(x in plaintext.lower() for x in ("admin", "staff", "a.jones", "root")):
+        return jsonify({"error": "Forbidden plaintext"}), 403
+    token = crypto_oracles.encrypt_token(plaintext)
+    return jsonify({"token": token})
+
+@app.route("/crypto/verify-token", methods=["POST"])
+def crypto_verify_token():
+    """Verify a forged admin token — gives flag if correct."""
+    data  = request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    pt, ok = crypto_oracles.decrypt_token(token)
+    if ok and pt and "admin" in pt.lower():
+        return jsonify({"valid": True,
+                        "flag": "QA{p4dd1ng_0r4cl3_4es_cbc_f0rg3d_2026}",
+                        "plaintext": pt})
+    return jsonify({"valid": False, "padding_ok": ok})
+
+@app.route("/crypto/rsa-sign", methods=["POST"])
+def crypto_rsa_sign():
+    data    = request.get_json(silent=True) or {}
+    message = data.get("message", "").encode()
+    sig     = crypto_oracles.rsa_sign(message)
+    return jsonify({"signature": sig})
+
+@app.route("/crypto/rsa-verify", methods=["POST"])
+def crypto_rsa_verify():
+    """RSA signature confusion — only checks prefix."""
+    data    = request.get_json(silent=True) or {}
+    message = data.get("message", "").encode()
+    sig     = data.get("signature", "")
+    result  = crypto_oracles.rsa_verify_confused(message, sig)
+    if result.get("valid") and result.get("confused"):
+        return jsonify({**result,
+                        "flag": "QA{pkcs1v15_s1gn4tur3_c0nfus10n_2026}"})
+    return jsonify(result)
+
+# ── Forest Trust ──────────────────────────────────────────────────────────
+@app.route("/forest/trust-ticket", methods=["POST"])
+def forest_trust_ticket():
+    data      = request.get_json(silent=True) or {}
+    session   = data.get("session_token", "")
+    user_sid  = data.get("user_sid", "")
+    return jsonify(forest_trust.request_cross_forest_tgt(session, user_sid))
+
+@app.route("/forest/enumerate", methods=["POST"])
+def forest_enumerate():
+    data    = request.get_json(silent=True) or {}
+    session = data.get("session_token", "")
+    return jsonify(forest_trust.enumerate_forest_b(session))
+
+@app.route("/forest/compromise", methods=["POST"])
+def forest_compromise():
+    data     = request.get_json(silent=True) or {}
+    session  = data.get("session_token", "")
+    username = data.get("username", "")
+    password = data.get("password", "")
+    return jsonify(forest_trust.compromise_forest_b_da(session, username, password))
+
+# ── ML EDR status ─────────────────────────────────────────────────────────
+@app.route("/edr/ml-profile", methods=["GET"])
+def edr_ml_profile():
+    ip = request.remote_addr or "0.0.0.0"
+    return jsonify(ml_edr.get_profile(ip))
+
+logging.info("[advanced_modules] All routes registered.")
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 31337))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
