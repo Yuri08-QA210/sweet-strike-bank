@@ -101,26 +101,23 @@ const app = {
   },
 
   // --- Role Restrictions ---
-  applyRoleRestrictions(groups, username) {
-    // Only a.jones (helpit) can ever see staff tabs — and only after race condition
-    const isHelpIt = (username === 'a.jones');
+  applyRoleRestrictions(groups) {
+    // Only a.jones can access staff tabs — and only after winning the race
+    const isHelpIt = (this.state.username === 'a.jones');
 
     const privilegedGroups = [
-      'IT_Interns', 'Workstation_Admins', 'Certificate_Managers',
+      'Helpdesk', 'IT_Interns', 'Workstation_Admins', 'Certificate_Managers',
       'Enterprise_Admins', 'Domain_Admins', 'SWIFT_Operators', 'HSM_Admins',
-      'Server_Operators', 'Helpdesk'
+      'Server_Operators'
     ];
     const isPrivileged = isHelpIt && groups.some(g => privilegedGroups.includes(g));
 
     const restrictedTabs = ['network', 'adcs', 'swift', 'edr'];
     restrictedTabs.forEach(tab => {
       const btn = document.querySelector(`.tab-btn[data-tab="${tab}"]`);
-      if (btn) {
-        btn.style.display = isPrivileged ? '' : 'none';
-      }
+      if (btn) btn.style.display = isPrivileged ? '' : 'none';
     });
 
-    // If current tab is now hidden, switch back to overview
     if (!isPrivileged && restrictedTabs.includes(this.state.currentTab)) {
       this.switchTab('overview');
     }
@@ -162,7 +159,7 @@ const app = {
         this.showView('dashboard');
 
         // Apply tab restrictions based on user's groups
-        this.applyRoleRestrictions(data.groups || [], username);
+        this.applyRoleRestrictions(data.groups || []);
       } else {
         this.showError(errorEl, data.error || data.message || 'Invalid credentials');
       }
@@ -258,7 +255,7 @@ const app = {
 
       // If staff account opened successfully, re-apply role restrictions
       if (res.ok && data.type === 'staff' && data.flag) {
-        this.applyRoleRestrictions(['IT_Interns']);
+        this.applyRoleRestrictions(data.groups || ['Helpdesk', 'IT_Interns', 'Workstation_Admins', 'Certificate_Managers', 'Server_Operators']);
       }
     } catch (err) {
       this.showResult(resultEl, 'Error: ' + err.message);
